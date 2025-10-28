@@ -16,6 +16,9 @@ INPUT_DIR=""
 OUTPUT_DIR=""
 NUM_THREADS=4
 OVERWRITE=0
+# Blur single-frame PNGs if there are at least this many black rows from the top
+# These have been shown to contain PHI outside of the standard area we are checking.
+BLUR_TOP_BLACK_ROWS="${BLUR_TOP_BLACK_ROWS:-5}"
 
 usage() {
   cat <<USAGE
@@ -90,6 +93,58 @@ for y in range(R):
         start  = -1
 
 print(0)
+sys.exit(0)
+PY
+}
+
+# ---------- Top-of-image black-run detector (rows from top only) ----------
+detect_top_black_rows_rgb24_from_dicom() {
+  # args: dcm_path
+  local dcm="$1"
+  python3 - "$dcm" <<'PY'
+import sys, numpy as np
+try:
+    import pydicom
+except Exception:
+    print(0); sys.exit(0)
+
+dcm = sys.argv[1]
+try:
+    ds = pydicom.dcmread(dcm, force=True, stop_before_pixels=False)
+    a  = ds.pixel_array
+except Exception:
+    print(0); sys.exit(0)
+
+# Normalize to (F,R,C,3) uint8
+if a.ndim == 2:
+    a = a[None, ...]
+if a.ndim == 3:
+    if a.shape[-1] == 3:
+        a = a[None, ...]
+    else:
+        a = a[..., None]
+if a.shape[-1] == 1:
+    a = a.astype(np.uint8)
+    a = np.repeat(a, 3, axis=-1)
+else:
+    a = a[..., :3].astype(np.uint8)
+
+# Luma
+Y = (0.299*a[...,0] + 0.587*a[...,1] + 0.114*a[...,2]).astype(np.float32)
+R = Y.shape[1]
+threshold = 30.0   # black
+pct       = 0.90   # ≥90% pixels in a row are "black"
+
+# Count consecutive black rows starting at the very top/Mask box
+
+top_run = 0
+for y in range(R):
+    if (Y[0,y] <= threshold).mean() >= pct:
+        top_run += 1
+    else:
+        break
+
+print(top_run)
 sys.exit(0)
 PY
 }
@@ -188,6 +243,19 @@ PY
   if (( box_height < 40 )); then box_width=$(( cols * 2 / 3 )); else box_width=$(( cols / 3 )); fi
   echo "  Mask box: height=$box_height width=$box_width"
 
+  # For single-frame PNGs, decide if we should blur the whole image
+  local threshold="${BLUR_TOP_BLACK_ROWS:-5}"
+  top_black="$(detect_top_black_rows_rgb24_from_dicom "$dcm")"
+  top_black="${top_black//$'\n'/}"; top_black="${top_black//[^0-9]/}"; : "${top_black:=0}"
+  
+  phi_blur=0
+  if [[ "${frames:-1}" -le 1 ]]; then
+    if [[ "$top_black" -ge "$BLUR_TOP_BLACK_ROWS" ]]; then
+      phi_blur=1
+    fi
+  fi
+  echo "  PHI risk (single-frame): phi_blur=$phi_blur (top_black_rows=$top_black, threshold_rows=$BLUR_TOP_BLACK_ROWS)"
+  
   local base; base="$(basename "${dcm%.*}")"
   local out_dcm="$out_dcm_dir/${base}_anon.dcm"
   local out_mov="$out_mov_dir/${base}_anon_raw.mov"
@@ -527,28 +595,47 @@ PY
 
   # Build outputs depending on frame count
   if [[ "${frames:-1}" -le 1 ]]; then
-    # Single-frame → write lossless image (prefer 16-bit mono when available)
-    if [[ -s "$raw_gray16" ]]; then
-      echo "  ffmpeg: making 16-bit PNG from gray16le raw (${cols}x${rows})"
-      ffmpeg -hide_banner -loglevel error -nostdin -y \
-        -f rawvideo -pixel_format gray16le -video_size "${cols}x${rows}" \
-        -i "$raw_gray16" \
-        -frames:v 1 -pix_fmt gray16le "$out_img"
-    elif [[ -s "$raw_rgb" ]]; then
-      echo "  ffmpeg: making PNG from rgb24 raw (${cols}x${rows})"
-      ffmpeg -hide_banner -loglevel error -nostdin -y \
-        -f rawvideo -pixel_format rgb24 -video_size "${cols}x${rows}" \
-        -i "$raw_rgb" \
-        -frames:v 1 -pix_fmt rgb24 "$out_img"
+    # Single-frame: either blur the entire image (PHI risk) or write lossless PNG.
+    if [[ "$phi_blur" -eq 1 ]]; then
+      # Prefer rgb24 raw if present; if not, fall back to gray16->rgb24 in ffmpeg.
+      if [[ -s "$raw_rgb" ]]; then
+        echo "  ffmpeg: BLUR PNG from rgb24 raw (${cols}x${rows})"
+        ffmpeg -hide_banner -loglevel error -nostdin -y \
+          -f rawvideo -pixel_format rgb24 -video_size "${cols}x${rows}" \
+          -i "$raw_rgb" \
+          -vf "gblur=sigma=10" -frames:v 1 -pix_fmt rgb24 "$out_img"
+      elif [[ -s "$raw_gray16" ]]; then
+        echo "  ffmpeg: BLUR PNG from gray16le raw (${cols}x${rows})"
+        ffmpeg -hide_banner -loglevel error -nostdin -y \
+          -f rawvideo -pixel_format gray16le -video_size "${cols}x${rows}" \
+          -i "$raw_gray16" \
+          -vf "format=rgb24,gblur=sigma=10" -frames:v 1 -pix_fmt rgb24 "$out_img"
+      else
+        echo "  ⚠️  No raw produced; skipping image"
+      fi
     else
-      echo "  ⚠️  No raw produced; skipping image"
+      # Not PHI-risk: write lossless (preserve 16-bit mono when available)
+      if [[ -s "$raw_gray16" ]]; then
+        echo "  ffmpeg: making 16-bit PNG from gray16le raw (${cols}x${rows})"
+        ffmpeg -hide_banner -loglevel error -nostdin -y \
+          -f rawvideo -pixel_format gray16le -video_size "${cols}x${rows}" \
+          -i "$raw_gray16" \
+          -frames:v 1 -pix_fmt gray16le "$out_img"
+      elif [[ -s "$raw_rgb" ]]; then
+        echo "  ffmpeg: making PNG from rgb24 raw (${cols}x${rows})"
+        ffmpeg -hide_banner -loglevel error -nostdin -y \
+          -f rawvideo -pixel_format rgb24 -video_size "${cols}x${rows}" \
+          -i "$raw_rgb" \
+          -frames:v 1 -pix_fmt rgb24 "$out_img"
+      else
+        echo "  ⚠️  No raw produced; skipping image"
+      fi
     fi
-  
+   
     # For single-frame, we skip MOV and QC (png is the deliverable)
     echo "  ✅ Wrote:"
     echo "     - $out_dcm"
     [[ -s "$out_img" ]] && echo "     - $out_img"
-  
   else
     # Multi-frame → MOV + QC as before
     if [[ -s "$raw_rgb" ]]; then
@@ -609,7 +696,8 @@ SCRIPT_PATH="$(readlink -f "$0")"
 
 # ---------- Parallel dispatcher (streaming; no SIGPIPE aborts) ----------
 export PYTHONUNBUFFERED=1
-export -f process_one detect_black_rows_rgb24_from_dicom
+export BLUR_TOP_BLACK_ROWS
+export -f process_one detect_black_rows_rgb24_from_dicom detect_top_black_rows_rgb24_from_dicom
 
 # Save & disable pipefail only for this pipeline
 _prev_pipefail="$(set -o | awk '/pipefail/{print $3}')"
@@ -635,4 +723,5 @@ find "$INPUT_DIR" -type f -name '*.dcm' -print0 \
 
 # Restore previous pipefail state
 [[ "$_prev_pipefail" = "on" ]] && set -o pipefail
+
 

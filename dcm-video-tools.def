@@ -17,7 +17,7 @@ Usage:
 
 # >>> Copy files from host into the image (relative to the .def file) <<<
 %files
-    dicom_video_anonymization/dicom_video_anonymization.sh /opt/app/dicom_video_anonymization
+    bin/dicom_video_anonymization.sh /opt/app/dicom_video_anonymization
 
 %post
     set -eux
@@ -30,7 +30,7 @@ Usage:
     apt-get clean
     rm -rf /var/lib/apt/lists/*
 
-    pip3 install --no-cache-dir pydicom
+    pip3 install --no-cache-dir pydicom numpy pylibjpeg[all]
 
     chmod 755 /opt/app/dicom_video_anonymization
 
