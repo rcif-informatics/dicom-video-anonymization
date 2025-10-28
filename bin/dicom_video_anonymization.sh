@@ -318,6 +318,7 @@ PY
   SRC_DCM="$dcm" OUT_DCM="$out_dcm" \
   RAW_OUT="$raw_rgb" \
   RAW_GRAY16_OUT="$raw_gray16" \
+  PHI_BLUR="$phi_blur" \
   python3 - <<'PY'
 import os, sys
 import numpy as np
@@ -385,6 +386,76 @@ try:
     frames = arr_rgb.shape[0]  # trust decoded frames count
 except Exception as e:
     print(f"NOTE: could not build arr_rgb for MOV ({e}); MOV may be skipped.", file=sys.stderr)
+
+# --------- If flagged to blur the WHOLE image (single-frame PHI risk) ----------
+phi_blur = (os.environ.get("PHI_BLUR", "0") == "1")
+if phi_blur:
+    # We require a decoded array
+    if arr_rgb is None:
+        try:
+            arr_dec = ds.pixel_array
+            arr_rgb = to_rgb_uint8(arr_dec, pi)
+            frames = arr_rgb.shape[0]
+        except Exception as e:
+            print(f"ERROR: PHI_BLUR set but could not decode image ({e})", file=sys.stderr)
+            sys.exit(2)
+
+    # Only defined for single frame per your policy
+    if frames != 1:
+        print("NOTE: PHI_BLUR set but NumberOfFrames != 1; skipping PHI blur path.", file=sys.stderr)
+    else:
+        # ---- Simple separable box blur (approx Gaussian) on RGB uint8 ----
+        import numpy as _np
+
+        def box_blur_channel(ch, k=5, passes=2):
+            # ch: (H,W) uint8, k odd
+            r = k // 2
+            out = ch.astype(_np.float32, copy=False)
+            for _ in range(passes):
+                # horizontal
+                pad = _np.pad(out, ((0,0),(r,r)), mode='edge')
+                csum = pad.cumsum(axis=1)
+                out = (csum[:, k:] - csum[:, :-k]) / k
+                # vertical
+                pad = _np.pad(out, ((r,r),(0,0)), mode='edge')
+                csum = pad.cumsum(axis=0)
+                out = (csum[k:, :] - csum[:-k, :]) / k
+            return out.clip(0,255).astype(_np.uint8)
+
+        img = arr_rgb[0]                # (H,W,3) uint8
+        img_blur = _np.empty_like(img)
+        img_blur[...,0] = box_blur_channel(img[...,0], k=5, passes=2)
+        img_blur[...,1] = box_blur_channel(img[...,1], k=5, passes=2)
+        img_blur[...,2] = box_blur_channel(img[...,2], k=5, passes=2)
+
+        # Replace DICOM PixelData with blurred RGB, write as uncompressed Explicit VR Little Endian
+        from pydicom.uid import ExplicitVRLittleEndian
+        ds.file_meta.TransferSyntaxUID = ExplicitVRLittleEndian
+        ds.PhotometricInterpretation = "RGB"
+        ds.SamplesPerPixel = 3
+        ds.PlanarConfiguration = 0
+        ds.BitsAllocated = 8
+        ds.BitsStored = 8
+        ds.HighBit = 7
+        if "NumberOfFrames" in ds:
+            del ds.NumberOfFrames  # ensure single-frame
+
+        ds[Tag(0x7fe0,0x0010)] = pydicom.dataelem.DataElement(
+            Tag(0x7fe0,0x0010), "OW", img_blur.astype(_np.uint8).tobytes(order="C")
+        )
+        pydicom.dcmwrite(outp, ds, write_like_original=False)
+        print(f"Wrote DICOM (PHI-BLUR single-frame → uncompressed RGB): {outp}")
+
+        # Also emit rgb24 raw to keep downstream PNG generation consistent
+        if raw_out:
+            try:
+                with open(raw_out, "wb") as fh:
+                    fh.write(img_blur.reshape(-1,3).tobytes(order="C"))
+                print(f"Wrote rgb24 raw (blurred): {raw_out}")
+            except Exception as e:
+                print(f"ERROR: failed to write blurred rgb24 raw: {e}", file=sys.stderr)
+
+        sys.exit(0)
 
 # Clamp ROI within image
 boxw = max(0, min(boxw, cols))
