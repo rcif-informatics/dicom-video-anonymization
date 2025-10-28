@@ -16,6 +16,7 @@ INPUT_DIR=""
 OUTPUT_DIR=""
 NUM_THREADS=4
 OVERWRITE=0
+KEEP_RAW="${KEEP_RAW:-0}"   # set to 1 to keep *.raw intermediates
 # Blur single-frame PNGs if there are at least this many black rows from the top
 # These have been shown to contain PHI outside of the standard area we are checking.
 BLUR_TOP_BLACK_ROWS="${BLUR_TOP_BLACK_ROWS:-5}"
@@ -299,6 +300,16 @@ PY
   # Path for rgb24 raw stream (all frames)
   raw_rgb="$out_mov.rgb24.raw"
   raw_gray16="$out_img.gray16le.raw"
+
+  cleanup_raws() {
+    [[ "$KEEP_RAW" -eq 1 ]] && return 0
+    local deleted=0
+    if [[ -n "${raw_rgb:-}"    && -e "$raw_rgb"    ]]; then rm -f -- "$raw_rgb";    deleted=1; fi
+    if [[ -n "${raw_gray16:-}" && -e "$raw_gray16" ]]; then rm -f -- "$raw_gray16"; deleted=1; fi
+    [[ $deleted -eq 1 ]] && echo "🧹 cleaned intermediate raw files"
+  }
+  
+  trap cleanup_raws RETURN
 
   # Call Python to LOSSLESSLY mask native Pixel Data inside DICOM
   ROWS="$rows" COLS="$cols" BITS="$bits" FRAMES="$frames" \
