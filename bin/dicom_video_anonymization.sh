@@ -211,23 +211,57 @@ PY
   echo -e "\n🧩 [$rel_full] $(basename "$dcm")"
   echo "  Rows=$rows Cols=$cols Bits=$bits PI=$pi Frames=$frames Planar=$planar TSUID=$tsuid"
 
+  echo "  Normalized TSUID='$tsuid'"
+
   # Endianness from TS
   local endian="LE"
   [[ "$tsuid" == "1.2.840.10008.1.2.2" ]] && endian="BE"
 
   # Allow uncompressed and JPEG Baseline (decode once, no extra loss)
   case "$tsuid" in
-    1.2.840.10008.1.2|1.2.840.10008.1.2.1|1.2.840.10008.1.2.2)
+    # --- Uncompressed syntaxes ---
+    1.2.840.10008.1.2|1.2.840.10008.1.2.1|1.2.840.10008.1.2.2|\
+    ImplicitVRLittleEndian|LittleEndianImplicit|\
+    ExplicitVRLittleEndian|LittleEndianExplicit|\
+    ExplicitVRBigEndian|BigEndianExplicit)
       codec="uncompressed"
       ;;
-    1.2.840.10008.1.2.4.50|JPEGBaseline)
+  
+    # --- JPEG Baseline (Process 1) ---
+    1.2.840.10008.1.2.4.50|JPEGBaseline|JPEGProcess1)
       codec="jpeg-baseline"
       ;;
+  
+    # --- JPEG-LS ---
+    1.2.840.10008.1.2.4.80|1.2.840.10008.1.2.4.81|\
+    JPEGLSLossless|JPEGLSNearLossless)
+      codec="jpeg-ls"
+      ;;
+  
+    # --- JPEG 2000 (Lossless/Lossy) ---
+    1.2.840.10008.1.2.4.90|1.2.840.10008.1.2.4.91|\
+    JPEG2000LosslessOnly|JPEG2000Lossless|JPEG2000|JPEG2000Lossy)
+      codec="jpeg2000"
+      ;;
+  
+    # --- RLE ---
+    1.2.840.10008.1.2.5|RLELossless)
+      codec="rle"
+      ;;
+  
+    # --- Default: unsupported / vendor private ---
     *)
       echo "  ⚠️  SKIP (compressed TSUID=$tsuid not supported yet)."
       return 0
       ;;
   esac
+
+  : "${codec:=__UNSET__}"
+  if [[ "$codec" == "__UNSET__" ]]; then
+    echo "  ❌ INTERNAL: codec not set; TSUID='$tsuid'"; return 1
+  fi
+
+
   echo "  Pixel codec: $codec"
 
   # Compute mask box (detect top black rows by decoding 1 frame ONLY for analysis)
@@ -379,26 +413,36 @@ def to_rgb_uint8(arr, pi_hint):
         arr = arr[..., :3].astype(_np.uint8)  # drop alpha if present
     return arr
 
+# --------- Build arr_rgb (decode once) ----------
 arr_rgb = None
 try:
-    arr_dec = ds.pixel_array  # decodes compressed (needs pylibjpeg/gdcm) and uncompressed
+    arr_dec = ds.pixel_array
     arr_rgb = to_rgb_uint8(arr_dec, pi)
-    frames = arr_rgb.shape[0]  # trust decoded frames count
+    frames = arr_rgb.shape[0]
 except Exception as e:
-    print(f"NOTE: could not build arr_rgb for MOV ({e}); MOV may be skipped.", file=sys.stderr)
+    print(f"NOTE: could not decode pixel data for RGB ({e})", file=sys.stderr)
+
+dec_rows = rows
+dec_cols = cols
+if arr_rgb is not None:
+    dec_rows = arr_rgb.shape[1]
+    dec_cols = arr_rgb.shape[2]
+
+# Clamp ROI to decoded shape (NOT the tag shape)
+boxw = max(0, min(boxw, dec_cols))
+boxh = max(0, min(boxh, dec_rows))
+
+# If we have an RGB decode, mirror the mask for MOV/PNG output safely
+if arr_rgb is not None and boxw > 0 and boxh > 0:
+    arr_rgb[:, 0:boxh, 0:boxw, :] = 0
 
 # --------- If flagged to blur the WHOLE image (single-frame PHI risk) ----------
 phi_blur = (os.environ.get("PHI_BLUR", "0") == "1")
 if phi_blur:
     # We require a decoded array
     if arr_rgb is None:
-        try:
-            arr_dec = ds.pixel_array
-            arr_rgb = to_rgb_uint8(arr_dec, pi)
-            frames = arr_rgb.shape[0]
-        except Exception as e:
-            print(f"ERROR: PHI_BLUR set but could not decode image ({e})", file=sys.stderr)
-            sys.exit(2)
+       print("ERROR: PHI blur requested but pixel decode failed", file=sys.stderr)
+       sys.exit(2)
 
     # Only defined for single frame per your policy
     if frames != 1:
@@ -437,6 +481,8 @@ if phi_blur:
         ds.BitsAllocated = 8
         ds.BitsStored = 8
         ds.HighBit = 7
+        ds.Rows = dec_rows
+        ds.Columns = dec_cols
         if "NumberOfFrames" in ds:
             del ds.NumberOfFrames  # ensure single-frame
 
@@ -456,14 +502,6 @@ if phi_blur:
                 print(f"ERROR: failed to write blurred rgb24 raw: {e}", file=sys.stderr)
 
         sys.exit(0)
-
-# Clamp ROI within image
-boxw = max(0, min(boxw, cols))
-boxh = max(0, min(boxh, rows))
-
-# If we have an RGB decode, mirror the mask for the MOV output
-if arr_rgb is not None and boxw > 0 and boxh > 0:
-    arr_rgb[:, 0:boxh, 0:boxw, :] = 0
 
 # --------- UNCOMPRESSED path: keep your PI-specific byte masking & TS ---------
 if not compressed:
@@ -656,6 +694,8 @@ ds.PlanarConfiguration = 0
 ds.BitsAllocated = 8
 ds.BitsStored = 8
 ds.HighBit = 7
+ds.Rows = dec_rows
+ds.Columns = dec_cols
 if frames > 1:
     ds.NumberOfFrames = str(frames)
 
@@ -674,6 +714,9 @@ if arr_rgb is not None and raw_out:
     except Exception as e:
         print(f"ERROR: failed to write rgb24 raw: {e}", file=sys.stderr)
 PY
+
+  rows="$(tag "$out_dcm" 0028,0010)"
+  cols="$(tag "$out_dcm" 0028,0011)"
 
   # Build outputs depending on frame count
   if [[ "${frames:-1}" -le 1 ]]; then
